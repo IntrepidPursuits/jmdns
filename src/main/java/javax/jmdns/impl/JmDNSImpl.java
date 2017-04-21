@@ -4,13 +4,14 @@
 
 package javax.jmdns.impl;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
-import java.net.DatagramPacket;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.MulticastSocket;
-import java.net.SocketException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -29,8 +30,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantLock;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import javax.jmdns.JmDNS;
 import javax.jmdns.ServiceEvent;
@@ -61,14 +60,7 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
         Remove, Update, Add, RegisterServiceType, Noop
     }
 
-    /**
-     * This is the multicast group, we are listening to for multicast DNS messages.
-     */
-    private volatile InetAddress     _group;
-    /**
-     * This is our multicast socket.
-     */
-    private volatile MulticastSocket _socket;
+    private SharedSocketImpl _sharedSocket;
 
     /**
      * Holds instances of JmDNS.DNSListener. Must by a synchronized collection, because it is updated from concurrent threads.
@@ -419,9 +411,12 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
 
         // Bind to multicast socket
         this.openMulticastSocket(this.getLocalHost());
-        this.start(this.getServices().values());
 
         this.startReaper();
+    }
+
+    public void start() {
+        this.start(this.getServices().values());
     }
 
     private void start(Collection<? extends ServiceInfo> serviceInfos) {
@@ -440,37 +435,7 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
     }
 
     private void openMulticastSocket(HostInfo hostInfo) throws IOException {
-        if (_group == null) {
-            if (hostInfo.getInetAddress() instanceof Inet6Address) {
-                _group = InetAddress.getByName(DNSConstants.MDNS_GROUP_IPV6);
-            } else {
-                _group = InetAddress.getByName(DNSConstants.MDNS_GROUP);
-            }
-        }
-        if (_socket != null) {
-            this.closeMulticastSocket();
-        }
-        // SocketAddress address = new InetSocketAddress((hostInfo != null ? hostInfo.getInetAddress() : null), DNSConstants.MDNS_PORT);
-        // System.out.println("Socket Address: " + address);
-        // try {
-        // _socket = new MulticastSocket(address);
-        // } catch (Exception exception) {
-        // logger.warn("openMulticastSocket() Open socket exception Address: " + address + ", ", exception);
-        // // The most likely cause is a duplicate address lets open without specifying the address
-        // _socket = new MulticastSocket(DNSConstants.MDNS_PORT);
-        // }
-        _socket = new MulticastSocket(DNSConstants.MDNS_PORT);
-        if ((hostInfo != null) && (hostInfo.getInterface() != null)) {
-            try {
-                _socket.setNetworkInterface(hostInfo.getInterface());
-            } catch (SocketException e) {
-                if (logger.isDebugEnabled()) {
-                    logger.debug("openMulticastSocket() Set network interface exception: " + e.getMessage());
-                }
-            }
-        }
-        _socket.setTimeToLive(255);
-        _socket.joinGroup(_group);
+        this._sharedSocket = SharedSocketImpl.get(hostInfo);
     }
 
     private void closeMulticastSocket() {
@@ -479,41 +444,33 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
         if (logger.isDebugEnabled()) {
             logger.debug("closeMulticastSocket()");
         }
-        if (_socket != null) {
-            // close socket
-            try {
-                try {
-                    _socket.leaveGroup(_group);
-                } catch (SocketException exception) {
-                    //
-                }
-                _socket.close();
-                // jP: 20010-01-18. It isn't safe to join() on the listener
-                // thread - it attempts to lock the IoLock object, and deadlock
-                // ensues. Per issue #2933183, changed this to wait on the JmDNS
-                // monitor, checking on each notify (or timeout) that the
-                // listener thread has stopped.
-                //
-                while (_incomingListener != null && _incomingListener.isAlive()) {
-                    synchronized (this) {
-                        try {
-                            if (_incomingListener != null && _incomingListener.isAlive()) {
-                                // wait time is arbitrary, we're really expecting notification.
-                                if (logger.isDebugEnabled()) {
-                                    logger.debug("closeMulticastSocket(): waiting for jmDNS monitor");
-                                }
-                                this.wait(1000);
+
+        if (_sharedSocket != null) {
+            _sharedSocket.release();
+            // jP: 20010-01-18. It isn't safe to join() on the listener
+            // thread - it attempts to lock the IoLock object, and deadlock
+            // ensues. Per issue #2933183, changed this to wait on the JmDNS
+            // monitor, checking on each notify (or timeout) that the
+            // listener thread has stopped.
+            //
+            while (_incomingListener != null && _incomingListener.isAlive()) {
+                synchronized (this) {
+                    try {
+                        if (_incomingListener != null && _incomingListener.isAlive()) {
+                            // wait time is arbitrary, we're really expecting notification.
+                            if (logger.isDebugEnabled()) {
+                                logger.debug("closeMulticastSocket(): waiting for jmDNS monitor");
                             }
-                        } catch (InterruptedException ignored) {
-                            // Ignored
+                            this.wait(1000);
                         }
+                    } catch (InterruptedException ignored) {
+                        // Ignored
                     }
                 }
-                _incomingListener = null;
-            } catch (final Exception exception) {
-                logger.warn("closeMulticastSocket() Close socket exception ", exception);
             }
-            _socket = null;
+            _incomingListener = null;
+
+            _sharedSocket = null;
         }
     }
 
@@ -710,7 +667,7 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
     @Override
     @Deprecated
     public InetAddress getInterface() throws IOException {
-        return _socket.getInterface();
+        return _sharedSocket.getSocket().getInterface();
     }
 
     /**
@@ -1565,36 +1522,7 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
      * @exception IOException
      */
     public void send(DNSOutgoing out) throws IOException {
-        if (!out.isEmpty()) {
-            final InetAddress addr;
-            final int port;
-
-            if (out.getDestination() != null) {
-                addr = out.getDestination().getAddress();
-                port = out.getDestination().getPort();
-            } else {
-                addr = _group;
-                port = DNSConstants.MDNS_PORT;
-            }
-
-            byte[] message = out.data();
-            final DatagramPacket packet = new DatagramPacket(message, message.length, addr, port);
-
-            if (logger.isTraceEnabled()) {
-                try {
-                    final DNSIncoming msg = new DNSIncoming(packet);
-                    if (logger.isTraceEnabled()) {
-                        logger.trace("send(" + this.getName() + ") JmDNS out:" + msg.print(true));
-                    }
-                } catch (final IOException e) {
-                    logger.debug(getClass().toString(), "send(" + this.getName() + ") - JmDNS can not parse what it sends!!!", e);
-                }
-            }
-            final MulticastSocket ms = _socket;
-            if (ms != null && !ms.isClosed()) {
-                ms.send(packet);
-            }
-        }
+        _sharedSocket.send(out);
     }
 
     /*
@@ -1876,6 +1804,10 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
 
             if (logger.isDebugEnabled()) {
                 logger.debug("Wait for JmDNS cancel: " + this);
+            }
+
+            if (!isCanceled() && cancelState()) {
+                startCanceler();
             }
             this.waitForCanceled(DNSConstants.CLOSE_TIMEOUT);
 
@@ -2262,11 +2194,11 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
     }
 
     public MulticastSocket getSocket() {
-        return _socket;
+        return _sharedSocket.getSocket();
     }
 
     public InetAddress getGroup() {
-        return _group;
+        return _sharedSocket.getGroup();
     }
 
     @Override

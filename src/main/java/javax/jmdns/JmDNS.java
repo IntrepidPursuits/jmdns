@@ -155,6 +155,8 @@ public abstract class JmDNS implements Closeable {
         return new JmDNSImpl(addr, name);
     }
 
+    public abstract void start();
+
     /**
      * Return the name of the JmDNS instance. This is an arbitrary string that is useful for distinguishing instances.
      *
