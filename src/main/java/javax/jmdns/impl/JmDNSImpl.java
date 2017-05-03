@@ -4,11 +4,15 @@
 
 package javax.jmdns.impl;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.MulticastSocket;
 import java.net.SocketException;
 import java.util.AbstractMap;
@@ -29,8 +33,6 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantLock;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import javax.jmdns.JmDNS;
 import javax.jmdns.ServiceEvent;
@@ -65,6 +67,8 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
      * This is the multicast group, we are listening to for multicast DNS messages.
      */
     private volatile InetAddress     _group;
+    
+    private volatile InetSocketAddress _groupAddress;
     /**
      * This is our multicast socket.
      */
@@ -419,9 +423,12 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
 
         // Bind to multicast socket
         this.openMulticastSocket(this.getLocalHost());
-        this.start(this.getServices().values());
 
         this.startReaper();
+    }
+
+    public void start() {
+        this.start(this.getServices().values());
     }
 
     private void start(Collection<? extends ServiceInfo> serviceInfos) {
@@ -446,6 +453,7 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
             } else {
                 _group = InetAddress.getByName(DNSConstants.MDNS_GROUP);
             }
+            _groupAddress = new InetSocketAddress(_group, DNSConstants.MDNS_PORT);
         }
         if (_socket != null) {
             this.closeMulticastSocket();
@@ -460,17 +468,19 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
         // _socket = new MulticastSocket(DNSConstants.MDNS_PORT);
         // }
         _socket = new MulticastSocket(DNSConstants.MDNS_PORT);
+        _socket.setTimeToLive(255);
         if ((hostInfo != null) && (hostInfo.getInterface() != null)) {
             try {
                 _socket.setNetworkInterface(hostInfo.getInterface());
+                _socket.joinGroup(_groupAddress, hostInfo.getInterface());
             } catch (SocketException e) {
                 if (logger.isDebugEnabled()) {
                     logger.debug("openMulticastSocket() Set network interface exception: " + e.getMessage());
                 }
             }
+        } else {
+            _socket.joinGroup(_group);
         }
-        _socket.setTimeToLive(255);
-        _socket.joinGroup(_group);
     }
 
     private void closeMulticastSocket() {
@@ -483,7 +493,11 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
             // close socket
             try {
                 try {
-                    _socket.leaveGroup(_group);
+                    if ((_localHost != null) && (_localHost.getInterface() != null)) {
+                        _socket.leaveGroup(_groupAddress, _localHost.getInterface());
+                    } else {
+                        _socket.leaveGroup(_group);
+                    }
                 } catch (SocketException exception) {
                     //
                 }
@@ -1876,6 +1890,10 @@ public class JmDNSImpl extends JmDNS implements DNSStatefulObject, DNSTaskStarte
 
             if (logger.isDebugEnabled()) {
                 logger.debug("Wait for JmDNS cancel: " + this);
+            }
+
+            if (!isCanceled() && cancelState()) {
+                startCanceler();
             }
             this.waitForCanceled(DNSConstants.CLOSE_TIMEOUT);
 
